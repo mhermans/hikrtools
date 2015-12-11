@@ -1,0 +1,402 @@
+---
+title: "Visualising your hiking trails and photos with My Tracks, R and Leaflet"
+output: 
+  html_document: 
+    keep_md: yes
+    self_contained: no
+---
+
+# Introduction
+
+After a hiking vacation, it is nice to have some sort of visual record afterwards. While there are likely professionaly solutions to record and visualise your trails, as a recreational hiker you can already get a lot of milage from your smartphone in combination with the R data-analysis ecosystem. 
+
+A few weeks ago, we used the Android app [My Tracks](https://play.google.com/store/apps/details?id=com.google.android.maps.mytracks) to record our hikes in Italy. It is a very basic, straightforward app: hit record, let it run while you walk around, and hit stop at the end. In the meantime it provides statistics & graphs on speed, elevation, etc. When home, you can view you hike in-app, or export the recorded GPS-information in different formats, including the [GPX-format](https://en.wikipedia.org/wiki/GPS_Exchange_Format), "the de-facto XML standard for lightweight interchange of GPS data".
+
+We will be using this exported GPX-data and demonstrate a few thing that you can do with it. More specifically, we will walk through:
+
+* Getting a ready-to-go GIS/R/RStudio-environment using [Docker](https://www.docker.com/) (optionally).
+* Loading the GPX data using the [GDAL-library](http://www.gdal.org/).
+* Accessing, preforming calculations and visualising the GPX waypoint-data.
+* Visualising GPX-track data on an interactive map using the Javascript [Leaflet-library](http://leafletjs.com/).
+* Adding photos taken during the hike to the map, based on timestamp-matching.
+
+This blogpost itself, including all the graphs, maps, etc. is generated from a [RMarkdown](http://rmarkdown.rstudio.com/)-file, so you can always check the source for details while reading.
+
+# Installing requirements 
+
+We will use four different R-libraries, and load the GPX-data using `rgdal`. This is the R-library wrapping [GDAL](http://www.gdal.org/), which is the workhorse for dealing with spatial dataformats. So before you install this R-library, you need to have GDAL installed. For installing the requirement to run the example/walkthrough, you should be OK on Debian-based GNU/Linux with:
+
+```
+apt-get install tk-dev libgdal-dev libimage-exiftool-perl libproj-dev
+```
+
+This also installs [exiftool](http://www.sno.phy.queensu.ca/~phil/exiftool/), which we will use later in the walkthrough. After installing the dependencies with `apt-get`, you can install in R the required libraries:
+
+```{r eval=FALSE}
+install.packages(c('rgdal', 'leaflet', 'sp', 'lubridate', 'ggplot2'))
+```
+
+An alternative to the above installation steps is using [Docker](https://www.docker.com/), an open source system to virtualize (or 'containerize') specific software configurations. Building [this Dockerfile](https://gist.github.com/mhermans/2fb5a935467881d8c3c4) gives you all the requirements and a Rstudio-instance ready to go on http://localhost:8787.
+
+# Loading and manipulating GPX waypoints
+
+The [GPX-format](https://en.wikipedia.org/wiki/GPS_Exchange_Format) defines both *waypoints* and *tracks*, with the later containing one or more of the former (we disregard routes). In this section, we will read-in and demonstrate operations with the *waypoints*, the *tracks* are used below.
+
+Loading the required R-libraries:
+
+```{r, message=FALSE}
+library(leaflet)  # for generating interactive Javascript maps
+library(rgdal)    # GDAL bindings for loading GPX-data
+library(sp)       # spatial operations library
+library(lubridate)# datetime-operatings, here to convert from strings
+library(ggplot2)  # general plotting library
+```
+
+After loading the required libraries, calling `readOGR()`, with parameter specifying 'track_points', gets you the waypoint data:
+
+```{r, message=FALSE}
+GPX_file <- 'gimillan_grauson/20151001_Italy_Gimillan-Grauson.gpx'
+wp <- readOGR(GPX_file, layer = "track_points")
+```
+
+GDAL tells you it has read in `r nrow(wp)` observations/waypoints, structured in a dataframe with `r ncol(wp)` columns, of which the `ele`(vation) and `time`-column are the most relevant, together with the coordinates:
+
+```{r}
+head(wp[,c('ele', 'time')])
+```
+
+This resulting `SpatialPointsDataFrame`-object (assigned to "wp"), allows for both "traditional" R-operations on the dataframe of waypoints, spatial operations, and the combination of both. For instance, the build in R function `max()` and `min()` give you the height climbed during the hike:
+
+```{r}
+max(wp$ele) - min(wp$ele) # height climbed in meters
+```
+
+At the same time, certain operations are much more conveniently performed using specialized functions included in R-libraries such as [sp](https://cran.r-project.org/web/packages/sp/index.html). E.g. the total distance travelled during the hike can be derived from the coordinates of the waypoints, by using `spDist()` to calculate a vector of distances between each waypoint, and passing that vector to `sum()`:
+
+```{r}
+hike.dists <- spDists(wp, segments=TRUE)
+sum(hike.dists) # about 11.8km hike
+```
+
+Plotting the elevation and timestamp of each waypoint using [ggplot](http://ggplot2.org/), allows us to visualise the hike towards the [valley of Grauson](https://it.wikipedia.org/wiki/Vallone_di_Grauson). As a preparatory step, we use the `ymd_hms()` function from the [lubridate](https://cran.r-project.org/web/packages/lubridate/vignettes/lubridate.html) library to convert the string representating the timestamp to a proper R time-object. As to not confuse `ggplot`, we also do not pass the `SpatialPointsDataFrame`-object directly, but convert it to a regular dataframe with `as.data.frame()`: 
+
+```{r}
+wp$time <- ymd_hms(wp$time)   # convert timestamps to datetime-objects
+
+p <- ggplot(as.data.frame(wp), # convert to regular dataframe
+            aes(x=time, y=ele)) 
+p + geom_point() + labs(x='Hiking time', y='Elevations (meters)')
+```
+
+Each individual dot is a recorded waypoint. The gap around 13h is the lunchbreak--My Tracks does not record additional waypoints if you are stationary.
+
+# Visualising tracks with Leaflet
+
+Apart from the individual waypoints, you can also explore the GPX-*track*. This track, representing the entire route of the hike, can be conveniently displayed on an interactive map using the [R leaflet library](https://rstudio.github.io/leaflet/), which bridges R and the fantastic [Leaflet Javascript library](http://leafletjs.com/). 
+
+Reading-in and displaying the GPX-track through Leaflet can be done in two lines: 
+
+```{r}
+track <- readOGR(GPX_file, layer = "tracks", verbose = FALSE)
+leaflet() %>% addTiles() %>% addPolylines(data=track)
+```
+
+In the above two lines, `leaflet()` will create a base map-object, `addTiles()` adds the default OpenStreeMap tiles, and `addPolyLines()` overlays the GPX-track in blue. These functions are chained together in the example with [magrittr](https://cran.r-project.org/web/packages/magrittr/vignettes/magrittr.html) 'pipes' ('%>%'), but this is optional. The resulting map from this 'chain' of functions will be displayed/re-generated in a dedicated Viewer-window in your Rstudio IDE, making this R+Leaflet+Rstudio combo pretty useful for tinkering with spatial data.
+
+If we forgo one-liners for some additional code, we can 'stack' a map with different tile-sets, controls to switch between them, a legend, etc. (inspired by [this post](http://spatialrecology.org/r/leafletmapping/)):
+
+```{r}
+m <- leaflet() %>%
+  
+  # Add tiles
+  addProviderTiles("Thunderforest.Landscape", group = "Topographical") %>%
+  addProviderTiles("OpenStreetMap.Mapnik", group = "Road map") %>%
+  addProviderTiles("Esri.WorldImagery", group = "Satellite") %>%
+  
+  addLegend(position = 'bottomright',opacity = 0.4, 
+            colors = 'blue', 
+            labels = 'Gimillan-Grausson',
+            title = 'Hikes Italy, region Aosta') %>%
+  
+  # Layers control
+  addLayersControl(position = 'bottomright',
+    baseGroups = c("Topographical", "Road map", "Satellite"),
+    overlayGroups = c("Hiking routes", "Photo markers"),
+    options = layersControlOptions(collapsed = FALSE)) %>%
+  
+  addPolylines(data=track, color='blue', group='Hiking routes') 
+
+m
+```
+
+# Adding photo-popups to the tracks
+
+We can add one or more markers to the map with `addMarkers()`, for instance annotate certain POI's. But more interesting would be displaying photos taken along the hiking trail using the markers.
+
+One issue is that while the My Tracks-app shows photos taken with the app at the correct points along the track, this GPS-information is not retained when exported. Nor is GPS-information available for the photos taken during the hike with our basic digital camera. These photos *do contain* the exact timestamp when shot, which can be matched with the timestamps of the recorded waypoints, allowing them to be spatially positioned. 
+
+The first step is getting the timestamp of the photo, which is *not* the creation date of the file (this can change when e.g. copying the file). A more robust approach, is accessing the [EXIF-metadata](https://en.wikipedia.org/wiki/Exchangeable_image_file_format) embedded in the photo. There does not appear to be a R-library that supports this out-of-the-box, but it is straightforward to wrap the excellent [exiftool](http://www.sno.phy.queensu.ca/~phil/exiftool/) in an R-function:
+
+```{r}
+exif_datetime <- function(path) {
+  # read out the picture-taken datetime for a file using exiftool
+  
+  exif_cmd <- 'exiftool -T -r -DateTimeOriginal '  
+  cmd <- paste(exif_cmd, '"', path, '"', sep='')
+  exif_timestamp <- system(cmd, intern = TRUE) # execute exiftool-command
+  
+  exif_timestamp
+}
+
+photo_timestamp <- exif_datetime('gimillan_grauson/photos/1-okt_-2015 13_49_42.jpeg')
+photo_timestamp
+```
+
+This basic function `exif_datetime()` takes the path of a picture, constructs a `exiftool`-command, and executes that command using the R-function `system()`, returning the timestamp when the photo was taken.
+
+Now that we have the photo-timestamp, we can make a vector of absolute differences between this timestamp, and the vector of timestamps of the waypoints. The position of the specific waypoint that is most close to the timestamp of the picture (i.e. has the lowest value in this vector of differences) is returned by the build-in function `which.min()`:
+
+```{r}
+wp_position <- which.min(abs(wp$time - ymd_hms(photo_timestamp)))
+wpd <- as.data.frame(wp)
+wp_match <- wpd[wp_position,
+                c('time', 'track_seg_point_id', 'coords.x1', 'coords.x2', 'ele')]
+wp_match
+```
+
+With an approximate two seconds difference, those coordinates are likely the most accurate positioning of the picture along the hiking trail. Using `addMarkers()`, we add an indicator at those coordinates, using instead of the default 'pin'-marker a stylized camera-icon.
+
+```{r}
+photoIcon <- makeIcon(
+  iconAnchorX = 12, iconAnchorY = 12, # center middle of icon on track,
+                                      # instead of top corner  
+  iconUrl = "https://www.mapbox.com/maki/renders/camera-12@2x.png"
+)
+
+m <- addMarkers(m, lng=wp_match$coords.x1, lat=wp_match$coords.x2,  
+                popup=photo_timestamp, # for now: just the timestamp as content of popup 
+                icon = photoIcon, # function providing custom marker-icons
+                group='Photo markers')
+m
+```
+
+Clicking on the popup shows the timestamp of the picture, but the goal is to display the photo and possibly some other information. The `popup`-parameter accepts a vector of HTML-snippets, so you can add whatever you want to the popups, including images.
+
+To preform the above steps, and generate this HTML-snippet, for each photo we use a couple of custom functions. They take as parameters the GPX-filename and path to a folder with photos that belong to that track/hike, and return the required information for `leaflet``. Three examples of hikes from the same vacation are included below, which also demonstrate how different tracks can be combined in a single map. Again, you can view/try out the full source.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+rm(list = ls())
+
+source('../../manipulate/gpx2leaflet.r')
+
+#setwd('data/201509_Italy/')
+
+# Read in required GPX-data and photo metadata
+# =============================================
+
+# Map 1: Cinque Terre (two tracks)
+# --------------------------------
+
+# Cinque Terre H1: Moterosso-Corniglia (23/09/2015)
+cinque.h1.gpx.fn <- 'monterosso_corniglia/20150923_Italy_Moterosso-Corniglia.gpx'
+cinque.h1.track <- readOGR(cinque.h1.gpx.fn, layer = "tracks", verbose=FALSE)
+cinque.h1.wp <- readOGR(cinque.h1.gpx.fn, layer = "track_points", verbose=FALSE)
+stopifnot(all(dim(cinque.h1.track) == c(1,13)),
+          all(dim(cinque.h1.wp) == c(2838,26)))
+
+cinque.h1.photos <- generatePhotoMarkers(
+  photo_dir = 'monterosso_corniglia/photos/',
+  waypoints = cinque.h1.wp,
+  base_url = 'monterosso_corniglia/photos/',
+  time_offset = 5260) # taken with seperate camera, time not aligned?
+
+
+# Cinque Terre H2: Corniglia-Vernazza (24/09/2015)
+cinque.h2.gpx.fn <- 'corniglia_vernazza/20150924_Italy_Corniglia-Vernazza.gpx'
+cinque.h2.track <- readOGR(cinque.h2.gpx.fn, layer = "tracks", verbose=FALSE)
+cinque.h2.wp <- readOGR(cinque.h2.gpx.fn, layer = "track_points", verbose=FALSE)
+stopifnot(all(dim(cinque.h2.track) == c(1,13)),
+          all(dim(cinque.h2.wp) == c(2298,26)))
+
+cinque.h2.photos <- generatePhotoMarkers(
+  photo_dir = 'corniglia_vernazza/photos/',
+  waypoints = cinque.h2.wp,
+  base_url = 'corniglia_vernazza/photos/',
+  time_offset = 7200) # timestamps photos smartphone are 2h off compared to GPX-data. TZ?
+
+
+# Map 2: Portofino (single track)
+# -------------------------------
+
+portofino.h1.gpx.fn <- 'portofinovetta_sanfrutuoso/20150926_Italy_PortofinoVetta-SanFrutuoso.gpx'
+portofino.h1.track <- readOGR(portofino.h1.gpx.fn, layer = "tracks", verbose=FALSE)
+portofino.h1.wp <- readOGR(portofino.h1.gpx.fn, layer = "track_points", verbose=FALSE)
+stopifnot(all(dim(portofino.h1.track) == c(1,13)),
+          all(dim(portofino.h1.wp) == c(1638,26)))
+
+portofino.h1.photos <- generatePhotoMarkers(
+  photo_dir = 'portofinovetta_sanfrutuoso/photos/',
+  waypoints = portofino.h1.wp,
+  base_url = 'portofinovetta_sanfrutuoso/photos/',
+  time_offset = 7200)
+
+
+# Map 3: Aosta (two tracks)
+# -------------------------
+
+# Aosta H1: Cogne-Lillaz
+aosta.h1.gpx.fn <- 'cogne_lillaz/20150930_Italy_Cogne-Lillaz.gpx'
+aosta.h1.track <- readOGR(aosta.h1.gpx.fn, layer = "tracks", verbose=FALSE)
+aosta.h1.wp <- readOGR(aosta.h1.gpx.fn, layer = "track_points", verbose=FALSE)
+aosta.h1.photos <- generatePhotoMarkers(
+  photo_dir = 'cogne_lillaz/photos/',
+  waypoints = aosta.h1.wp,
+  base_url = 'cogne_lillaz/photos/',
+  time_offset = 7200)
+
+# Aosta H2: Gimillan-Grauson
+aosta.h2.gpx.fn <- 'gimillan_grauson/20151001_Italy_Gimillan-Grauson.gpx'
+aosta.h2.track <- readOGR(aosta.h2.gpx.fn, layer = "tracks", verbose=FALSE)
+aosta.h2.wp <- readOGR(aosta.h2.gpx.fn, layer = "track_points", verbose=FALSE)
+aosta.h2.photos <- generatePhotoMarkers(
+  photo_dir = 'gimillan_grauson/photos/',
+  waypoints = aosta.h2.wp,
+  base_url = 'gimillan_grauson/photos/',
+  time_offset = 7200)
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Construct 3 joint Leaflet maps
+# ==============================
+
+# Construct the base map used for all maps 
+# ---------------------------------------
+
+photoIcon <- makeIcon(
+  iconAnchorX = 12, iconAnchorY = 12,
+  iconUrl = "https://www.mapbox.com/maki/renders/camera-12@2x.png"
+)
+
+m.base <- leaflet() %>%
+  
+  # Add tiles
+  addProviderTiles("Thunderforest.Landscape", group = "Topographical") %>%
+  addProviderTiles("OpenStreetMap.Mapnik", group = "Road map") %>%
+  addProviderTiles("Esri.WorldImagery", group = "Satellite") %>%
+  
+  # Layers control
+  addLayersControl(
+    baseGroups = c("Topographical", "Road map", "Satellite"),
+    overlayGroups = c("Hiking routes", "Photo markers"),
+    options = layersControlOptions(collapsed = FALSE))
+
+
+# Map 1 for Cinque Terre
+# --------------------
+
+m.cinque <- m.base %>% 
+  
+  # Add legend
+  addLegend(position = 'bottomleft',opacity = 0.4, 
+            colors = c('blue', 'red'), 
+            labels = c('Monterosso-Corniglia (23/09)',
+                       'Corniglia-Vernazza (24/09)'),
+            title = 'Hikes Italy, Cinque Terre') %>%
+  
+  # Add tracks
+  addPolylines(data=cinque.h1.track, 
+               color='blue', group='Hiking routes') %>%
+  addPolylines(data=cinque.h2.track, 
+               color='red', group='Hiking routes') %>%
+  
+  # Add photo markers
+  addMarkers(data=cinque.h1.photos, 
+             popup=cinque.h1.photos$popup_html, 
+             icon = photoIcon,
+             group='Photo markers') %>%
+  addMarkers(data=cinque.h2.photos, 
+             popup=cinque.h2.photos$popup_html,
+             icon = photoIcon,
+             group='Photo markers')
+
+
+# Map 2 for Portofinno
+# --------------------
+
+m.portofino <- m.base %>% 
+  
+  # Add legend
+  addLegend(position = 'bottomright',opacity = 0.4, 
+            colors = c('red'), 
+            labels = c('Portofino-San Fruttuoso (26/09)'),
+            title = 'Hikes Italy, region Portofino') %>%
+  
+  # Add tracks
+  addPolylines(data=portofino.h1.track, 
+               color='red', group='Hiking routes') %>%
+  
+  # Add photo markers
+  addMarkers(data=portofino.h1.photos, 
+             popup=portofino.h1.photos$popup_html, 
+             icon = photoIcon,
+             group='Photo markers')
+
+
+
+# Map 3 for Aosta
+# ---------------
+
+m.aosta <- m.base %>% 
+  
+  # Add legend
+  addLegend(position = 'topright',opacity = 0.4, 
+            colors = c('blue', 'red'), 
+            labels = c('Cogne-Lillaz (30/09)', 
+                       'Gimillan-Grausson (01/10)'),
+            title = 'Hikes Italy, region Aosta') %>%
+  
+  # Add tracks
+  addPolylines(data=aosta.h1.track, 
+               color='blue', group='Hiking routes') %>%
+  addPolylines(data=aosta.h2.track, 
+               color='red', group='Hiking routes') %>%
+  
+  # Add photo markers
+  addMarkers(data=aosta.h1.photos, 
+             popup=aosta.h1.photos$popup_html, 
+             icon = photoIcon,
+             group='Photo markers') %>%
+  addMarkers(data=aosta.h2.photos, 
+             popup=aosta.h2.photos$popup_html,
+             icon = photoIcon,
+             group='Photo markers')
+```
+
+# Complete examples
+
+## Hikes Italy, valley of Aosta (30/09-01/10)
+
+```{r, echo=FALSE}
+m.aosta
+```
+
+## Hike Italy, Portofino peninsula (26/09)
+
+```{r, echo=FALSE}
+m.portofino
+```
+
+## Hikes Italy, Cinque Terre (23-24/09)
+
+```{r, echo=FALSE}
+m.cinque
+```
+
+# Discussion
+
+The combination of RStudio and the [htmlwidgets](http://www.htmlwidgets.org/index.html) project, of which the R leaflet-library is a part, is shaping up to be a nice bridge between 'static/offline' data-exploration in R, and interactive/online visualisations. You will hit limits because aspects of the underlying Javascript libraries are hidden away--for instance changing the popup-dimensions was something I did not succeed in. But the trade-off between ease-of-use from R(Studio) and flexibility is generally OK.
+
+This R(Studio)--Leaflet combo can tap into the larger ecosystem of dedicated spatial libraries in R, and through the GNU/Linux environment into robust open source libraries such as `GDAL` and command line tools such as `exiftool`. While combining different robust libraries and ecosystems has clear advantages, the 'edges' between them can be a bit rough and frustrating, e.g. realising that a `SpatialPointsDataFrame` needs to be converted to a dataframe before passing it to `ggplot`.
+
+Also, this project was also for me the first instance of effectively using Docker. Installing and trying out different spatial R-libraries (without messing things up), exploring the data(format), writing out the code, drafting the blog-post in Markdown, etc., everything was doable from a self-contained instance, with RStudio running in-browse.r

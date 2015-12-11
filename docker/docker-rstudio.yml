@@ -1,0 +1,6 @@
+rstudio:
+    image: mhermans/rworkenv
+    ports:
+        - "8787:8787"
+    volumes:
+        - /home/mhermans/projects/:/home/rstudio/projects/

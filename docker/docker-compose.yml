@@ -1,0 +1,7 @@
+hiking_rstudio:
+    #image: mhermans/rgisgeo
+    build: .
+    ports:
+        - "8787:8787"
+    volumes:
+        - /home/mhermans/projects/hiking_vis/:/home/rstudio/hiking_vis
